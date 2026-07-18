@@ -1,11 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
-const db = require('./db');
-
-const authRoutes = require('./routes/auth');
-const importRoutes = require('./routes/import');
-const filesRoutes = require('./routes/files');
 
 const app = express();
 
@@ -14,37 +9,30 @@ app.use(express.json());
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ ok: true, message: 'A4 CLUB Backend is running!' });
+  res.json({ ok: true, message: 'Backend funcionando!' });
 });
 
-// Routes
-app.use('/auth', authRoutes);
-app.use('/import', importRoutes);
-app.use('/files', filesRoutes);
+// Test
+app.get('/test', (req, res) => {
+  res.json({ status: 'ok' });
+});
 
-// Error handler
-app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({ error: err.message });
+// Login teste
+app.post('/auth/login', (req, res) => {
+  const { email, senha } = req.body;
+  
+  if (email === 'camila@a4digital.com.br' && senha === 'senha123') {
+    res.json({
+      token: 'token-teste-123',
+      user: { id: 1, email, nome: 'Camila' }
+    });
+  } else {
+    res.status(401).json({ error: 'Inválido' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
 
-// Start server
-const startServer = async () => {
-  try {
-    await db.query('SELECT NOW()');
-    console.log('✅ Database connected!');
-    
-    app.listen(PORT, () => {
-      console.log(`🚀 A4 CLUB Backend running on port ${PORT}`);
-    });
-  } catch (err) {
-    console.error('❌ Database connection failed:', err);
-    process.exit(1);
-  }
-};
-
-startServer();
-
-module.exports = app;
+app.listen(PORT, () => {
+  console.log(`🚀 Backend rodando na porta ${PORT}`);
+});
