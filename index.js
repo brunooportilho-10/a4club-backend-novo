@@ -248,6 +248,12 @@ function extensao(nome) {
   return i >= 0 ? nome.slice(i + 1).toLowerCase() : '';
 }
 
+// Limpa prefixos comuns do nome do Drive para virar um nome de categoria bonito
+// Ex: "DV - Arquivos de Corte" -> "Arquivos de Corte"
+function nomeCategoria(nomeDrive) {
+  return nomeDrive.replace(/^DV\s*-\s*/i, '').trim();
+}
+
 async function listarRecursivo(drive, pastaId, caminho, lista, nivel) {
   if (nivel > 10) return;
   let pageToken = null;
@@ -285,7 +291,7 @@ async function atualizarJob(jobId, dados) {
   );
 }
 
-async function processarArquivo(drive, arq, pastaNome, contadores, errosLog) {
+async function processarArquivo(drive, arq, categoriaFixa, contadores, errosLog) {
   try {
     if (!arq.md5) {
       contadores.pulados++;
@@ -316,8 +322,10 @@ async function processarArquivo(drive, arq, pastaNome, contadores, errosLog) {
     });
     await upload.done();
 
+    // categoria = o Drive/pasta que foi sincronizada (fixa para o job inteiro)
+    // colecao = a subpasta logo abaixo dela (normalmente o nome do estudio/artista)
     const partes = arq.caminho.split('/').filter(Boolean);
-    const categoria = partes.length > 1 ? partes[1] : partes[0] || pastaNome;
+    const colecao = partes.length > 1 ? partes[1] : null;
 
     await docRef.set({
       nome: arq.nome,
@@ -326,7 +334,8 @@ async function processarArquivo(drive, arq, pastaNome, contadores, errosLog) {
       tamanho: arq.tamanho,
       mime: arq.mime,
       extensao: extensao(arq.nome),
-      categoria,
+      categoria: categoriaFixa,
+      colecao,
       caminho: arq.caminho,
       r2Key,
       driveId: arq.driveId,
@@ -336,8 +345,8 @@ async function processarArquivo(drive, arq, pastaNome, contadores, errosLog) {
 
     // Registra/atualiza a categoria numa colecao propria, para o catalogo
     // sempre listar TODAS as categorias existentes (nao so as dos arquivos recentes)
-    await db.collection('categorias').doc(categoria).set({
-      nome: categoria,
+    await db.collection('categorias').doc(categoriaFixa).set({
+      nome: categoriaFixa,
       total: admin.firestore.FieldValue.increment(1),
       atualizadoEm: new Date().toISOString(),
     }, { merge: true });
@@ -353,6 +362,7 @@ async function processarArquivo(drive, arq, pastaNome, contadores, errosLog) {
 async function executarJob(jobId, pastaId, pastaNome) {
   const contadores = { importados: 0, pulados: 0, erros: 0, processados: 0 };
   const errosLog = [];
+  const categoriaFixa = nomeCategoria(pastaNome);
   try {
     const oauth = await clientComTokens();
     if (!oauth) throw new Error('Google Drive nao conectado');
@@ -380,7 +390,7 @@ async function executarJob(jobId, pastaId, pastaNome) {
         const meuIndice = indice++;
         if (meuIndice >= lista.length) return;
         const arq = lista[meuIndice];
-        await processarArquivo(drive, arq, pastaNome, contadores, errosLog);
+        await processarArquivo(drive, arq, categoriaFixa, contadores, errosLog);
         contadores.processados++;
         if (contadores.processados % 10 === 0 || contadores.processados === lista.length) {
           await atualizarJob(jobId, { ...contadores, errosLog });
@@ -516,12 +526,11 @@ app.get('/api/catalogo/home', autenticar, async (req, res) => {
     const arquivos = recentes.docs.map((d) => {
       const a = d.data();
       return {
-        id: d.id, nome: a.nome, categoria: a.categoria,
+        id: d.id, nome: a.nome, categoria: a.categoria, colecao: a.colecao || null,
         extensao: a.extensao, tamanho: a.tamanho, importadoEm: a.importadoEm,
       };
     });
 
-    // Categorias vem da colecao propria - sempre TODAS, independente do que e recente
     const catsSnap = await db.collection('categorias').orderBy('nome').get();
     const categorias = catsSnap.docs.map((d) => ({
       nome: d.data().nome,
@@ -534,7 +543,6 @@ app.get('/api/catalogo/home', autenticar, async (req, res) => {
   }
 });
 
-// Lista arquivos de UMA categoria especifica (nao fica preso aos 24 recentes)
 app.get('/api/catalogo/categoria/:nome', autenticar, async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 100), 200);
@@ -545,7 +553,7 @@ app.get('/api/catalogo/categoria/:nome', autenticar, async (req, res) => {
     const arquivos = snap.docs.map((d) => {
       const a = d.data();
       return {
-        id: d.id, nome: a.nome, categoria: a.categoria,
+        id: d.id, nome: a.nome, categoria: a.categoria, colecao: a.colecao || null,
         extensao: a.extensao, tamanho: a.tamanho, importadoEm: a.importadoEm,
       };
     });
@@ -568,7 +576,7 @@ app.get('/api/catalogo/buscar', autenticar, async (req, res) => {
       .get();
     const arquivos = snap.docs.map((d) => {
       const a = d.data();
-      return { id: d.id, nome: a.nome, categoria: a.categoria, extensao: a.extensao, tamanho: a.tamanho };
+      return { id: d.id, nome: a.nome, categoria: a.categoria, colecao: a.colecao || null, extensao: a.extensao, tamanho: a.tamanho };
     });
     res.json({ ok: true, arquivos });
   } catch (e) {
