@@ -334,6 +334,14 @@ async function processarArquivo(drive, arq, pastaNome, contadores, errosLog) {
       downloads: 0,
     });
 
+    // Registra/atualiza a categoria numa colecao propria, para o catalogo
+    // sempre listar TODAS as categorias existentes (nao so as dos arquivos recentes)
+    await db.collection('categorias').doc(categoria).set({
+      nome: categoria,
+      total: admin.firestore.FieldValue.increment(1),
+      atualizadoEm: new Date().toISOString(),
+    }, { merge: true });
+
     contadores.importados++;
   } catch (e) {
     contadores.erros++;
@@ -512,9 +520,36 @@ app.get('/api/catalogo/home', autenticar, async (req, res) => {
         extensao: a.extensao, tamanho: a.tamanho, importadoEm: a.importadoEm,
       };
     });
-    const cats = new Set();
-    arquivos.forEach((a) => a.categoria && cats.add(a.categoria));
-    res.json({ ok: true, arquivos, categorias: Array.from(cats) });
+
+    // Categorias vem da colecao propria - sempre TODAS, independente do que e recente
+    const catsSnap = await db.collection('categorias').orderBy('nome').get();
+    const categorias = catsSnap.docs.map((d) => ({
+      nome: d.data().nome,
+      total: d.data().total || 0,
+    }));
+
+    res.json({ ok: true, arquivos, categorias });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Lista arquivos de UMA categoria especifica (nao fica preso aos 24 recentes)
+app.get('/api/catalogo/categoria/:nome', autenticar, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 100), 200);
+    const snap = await db.collection('arquivos')
+      .where('categoria', '==', req.params.nome)
+      .limit(limit)
+      .get();
+    const arquivos = snap.docs.map((d) => {
+      const a = d.data();
+      return {
+        id: d.id, nome: a.nome, categoria: a.categoria,
+        extensao: a.extensao, tamanho: a.tamanho, importadoEm: a.importadoEm,
+      };
+    });
+    res.json({ ok: true, arquivos });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
@@ -548,7 +583,11 @@ app.post('/api/catalogo/arquivo/:id/download', autenticar, async (req, res) => {
     const a = doc.data();
     const url = await getSignedUrl(
       r2,
-      new GetObjectCommand({ Bucket: R2_BUCKET, Key: a.r2Key }),
+      new GetObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: a.r2Key,
+        ResponseContentDisposition: `attachment; filename="${a.nome.replace(/"/g, '')}"`,
+      }),
       { expiresIn: 600 }
     );
     doc.ref.set({ downloads: (a.downloads || 0) + 1 }, { merge: true });
