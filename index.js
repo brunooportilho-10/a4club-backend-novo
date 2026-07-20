@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { google } = require('googleapis');
-const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, GetObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
@@ -496,6 +496,62 @@ app.get('/admin/jobs', autenticar, somenteAdmin, async (req, res) => {
     const jobs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     res.json({ ok: true, jobs });
   } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Apaga TODO o catalogo (Firestore + R2) para recomecar a importacao do zero.
+// Usar apos corrigir a logica de categorizacao, para nao deixar arquivos com categoria antiga.
+app.post('/admin/reset', autenticar, somenteAdmin, async (req, res) => {
+  if (req.body.confirmar !== 'LIMPAR TUDO') {
+    return res.status(400).json({ erro: 'Confirmacao invalida. Envie confirmar: "LIMPAR TUDO"' });
+  }
+  if (jobAtivo.id) {
+    return res.status(409).json({ erro: 'Ha uma importacao em andamento. Aguarde ou pause antes de limpar.' });
+  }
+  try {
+    let apagadosFirestore = 0;
+    // Apaga em lotes a colecao "arquivos"
+    let continuar = true;
+    while (continuar) {
+      const snap = await db.collection('arquivos').limit(400).get();
+      if (snap.empty) { continuar = false; break; }
+      const batch = db.batch();
+      snap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+      apagadosFirestore += snap.size;
+    }
+    // Apaga a colecao "categorias"
+    const catsSnap = await db.collection('categorias').get();
+    if (!catsSnap.empty) {
+      const batch = db.batch();
+      catsSnap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+
+    // Apaga os objetos do R2 (prefixo "arquivos/")
+    let apagadosR2 = 0;
+    let continuationToken = undefined;
+    do {
+      const listados = await r2.send(new ListObjectsV2Command({
+        Bucket: R2_BUCKET,
+        Prefix: 'arquivos/',
+        ContinuationToken: continuationToken,
+      }));
+      const objetos = (listados.Contents || []).map((o) => ({ Key: o.Key }));
+      if (objetos.length > 0) {
+        await r2.send(new DeleteObjectsCommand({
+          Bucket: R2_BUCKET,
+          Delete: { Objects: objetos },
+        }));
+        apagadosR2 += objetos.length;
+      }
+      continuationToken = listados.IsTruncated ? listados.NextContinuationToken : undefined;
+    } while (continuationToken);
+
+    res.json({ ok: true, apagadosFirestore, apagadosR2 });
+  } catch (e) {
+    console.log('Erro no reset: ' + e.message);
     res.status(500).json({ erro: e.message });
   }
 });
