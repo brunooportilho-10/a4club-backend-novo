@@ -827,6 +827,51 @@ app.post('/admin/usuarios/:uid/excluir', autenticar, somenteAdmin, async (req, r
   }
 });
 
+// Gera uma senha temporaria legivel (sem caracteres ambiguos tipo 0/O, 1/l)
+function gerarSenhaTemporaria() {
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  let senha = '';
+  for (let i = 0; i < 10; i++) {
+    senha += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return senha;
+}
+
+// Admin gera uma senha nova para o assinante (para mandar por WhatsApp, por exemplo)
+app.post('/admin/usuarios/:uid/resetar-senha', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    const novaSenha = gerarSenhaTemporaria();
+    await admin.auth().updateUser(req.params.uid, { password: novaSenha });
+    res.json({ ok: true, novaSenha });
+  } catch (e) {
+    console.log('Erro ao resetar senha: ' + e.message);
+    res.status(500).json({ erro: 'Erro ao resetar senha: ' + e.message });
+  }
+});
+
+// Cliente salva/atualiza o proprio WhatsApp (chamado logo apos o cadastro)
+app.post('/api/perfil', autenticar, async (req, res) => {
+  try {
+    const { whatsapp } = req.body;
+    const digitos = String(whatsapp || '').replace(/\D/g, '');
+    if (digitos.length < 10) {
+      return res.status(400).json({ erro: 'Numero de WhatsApp invalido' });
+    }
+    const ref = db.collection('usuarios').doc(req.usuario.uid);
+    const doc = await ref.get();
+    if (!doc.exists) {
+      const novo = dadosTrialNovo(req.usuario.email);
+      novo.whatsapp = whatsapp;
+      await ref.set(novo);
+    } else {
+      await ref.set({ whatsapp, atualizadoEm: new Date().toISOString() }, { merge: true });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
 // Exclui UM arquivo especifico (R2 + Firestore) e ajusta a contagem da categoria
 app.post('/admin/arquivo/:id/excluir', autenticar, somenteAdmin, async (req, res) => {
   try {
