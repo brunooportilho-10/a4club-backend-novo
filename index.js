@@ -116,6 +116,42 @@ function somenteAdmin(req, res, next) {
   return res.status(403).json({ erro: 'Acesso restrito ao administrador' });
 }
 
+function ehAdminEmail(email) {
+  return ADMIN_EMAILS.length === 0 || ADMIN_EMAILS.includes(email);
+}
+
+// Bloqueia o acesso ao catalogo para quem nao esta com assinatura 'pago'.
+// Admins sempre passam. Usuario novo eh criado automaticamente como 'pendente'.
+async function verificarAssinatura(req, res, next) {
+  if (ehAdminEmail(req.usuario.email)) return next();
+  try {
+    const ref = db.collection('usuarios').doc(req.usuario.uid);
+    const doc = await ref.get();
+    if (!doc.exists) {
+      await ref.set({
+        email: req.usuario.email,
+        status: 'pendente',
+        criadoEm: new Date().toISOString(),
+        atualizadoEm: new Date().toISOString(),
+      });
+      return res.status(403).json({
+        erro: 'Seu acesso ainda nao foi liberado. Entre em contato com o administrador do A4 CLUB.',
+        status: 'pendente',
+      });
+    }
+    const status = doc.data().status || 'pendente';
+    if (status !== 'pago') {
+      return res.status(403).json({
+        erro: 'Seu acesso esta bloqueado. Entre em contato com o administrador do A4 CLUB.',
+        status,
+      });
+    }
+    next();
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+}
+
 // ============ ROTAS PUBLICAS ============
 app.get('/', (req, res) => {
   res.json({
@@ -722,6 +758,34 @@ app.post('/admin/backfill-colecoes', autenticar, somenteAdmin, async (req, res) 
   }
 });
 
+// Relatorio de assinantes: todos que ja fizeram login (e portanto tem doc 'usuarios')
+app.get('/admin/usuarios', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    const snap = await db.collection('usuarios').orderBy('criadoEm', 'desc').get();
+    const usuarios = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+    res.json({ ok: true, usuarios });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Marca um assinante como pago / pendente / bloqueado
+app.post('/admin/usuarios/:uid/status', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!['pago', 'pendente', 'bloqueado'].includes(status)) {
+      return res.status(400).json({ erro: 'Status invalido' });
+    }
+    await db.collection('usuarios').doc(req.params.uid).set(
+      { status, atualizadoEm: new Date().toISOString() },
+      { merge: true }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
 app.get('/admin/stats', autenticar, somenteAdmin, async (req, res) => {
   try {
     const agg = await db.collection('arquivos').count().get();
@@ -757,7 +821,7 @@ app.get('/admin/stats', autenticar, somenteAdmin, async (req, res) => {
 });
 
 // ============ CATALOGO ============
-app.get('/api/catalogo/home', autenticar, async (req, res) => {
+app.get('/api/catalogo/home', autenticar, verificarAssinatura, async (req, res) => {
   try {
     const recentes = await db.collection('arquivos').orderBy('importadoEm', 'desc').limit(24).get();
     const arquivos = recentes.docs.map(mapArquivo);
@@ -791,7 +855,7 @@ app.get('/api/catalogo/home', autenticar, async (req, res) => {
 // Lista os "estudios" (subpastas) dentro de uma categoria - como navegar pastas do Drive
 // Navegacao genérica por pastas, em qualquer profundidade - igual ao Drive.
 // caminho='' = raiz da categoria. caminho='Lina Criativa/Cartao Sus 1' = dentro dessa subpasta.
-app.get('/api/catalogo/navegar', autenticar, async (req, res) => {
+app.get('/api/catalogo/navegar', autenticar, verificarAssinatura, async (req, res) => {
   try {
     const categoria = String(req.query.categoria || '');
     const caminho = String(req.query.caminho || '');
@@ -817,7 +881,7 @@ app.get('/api/catalogo/navegar', autenticar, async (req, res) => {
   }
 });
 
-app.get('/api/catalogo/categoria/:nome/colecoes', autenticar, async (req, res) => {
+app.get('/api/catalogo/categoria/:nome/colecoes', autenticar, verificarAssinatura, async (req, res) => {
   try {
     const snap = await db.collection('colecoes')
       .where('categoria', '==', req.params.nome)
@@ -839,7 +903,7 @@ app.get('/api/catalogo/categoria/:nome/colecoes', autenticar, async (req, res) =
 });
 
 // Arquivos de UM estudio especifico dentro da categoria
-app.get('/api/catalogo/categoria/:nome/estudio/:colecao', autenticar, async (req, res) => {
+app.get('/api/catalogo/categoria/:nome/estudio/:colecao', autenticar, verificarAssinatura, async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 300), 500);
     const snap = await db.collection('arquivos')
@@ -855,7 +919,7 @@ app.get('/api/catalogo/categoria/:nome/estudio/:colecao', autenticar, async (req
 });
 
 // Arquivos soltos direto na categoria (sem subpasta de estudio)
-app.get('/api/catalogo/categoria/:nome/soltos', autenticar, async (req, res) => {
+app.get('/api/catalogo/categoria/:nome/soltos', autenticar, verificarAssinatura, async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 300), 500);
     const snap = await db.collection('arquivos')
@@ -871,7 +935,7 @@ app.get('/api/catalogo/categoria/:nome/soltos', autenticar, async (req, res) => 
 });
 
 // Todos os arquivos de uma categoria, sem separar por estudio (uso geral/compatibilidade)
-app.get('/api/catalogo/categoria/:nome', autenticar, async (req, res) => {
+app.get('/api/catalogo/categoria/:nome', autenticar, verificarAssinatura, async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 100), 300);
     const snap = await db.collection('arquivos')
@@ -885,7 +949,7 @@ app.get('/api/catalogo/categoria/:nome', autenticar, async (req, res) => {
   }
 });
 
-app.get('/api/catalogo/buscar', autenticar, async (req, res) => {
+app.get('/api/catalogo/buscar', autenticar, verificarAssinatura, async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
     const limit = Math.min(Number(req.query.limit || 20), 50);
@@ -902,7 +966,7 @@ app.get('/api/catalogo/buscar', autenticar, async (req, res) => {
   }
 });
 
-app.post('/api/catalogo/arquivo/:id/download', autenticar, async (req, res) => {
+app.post('/api/catalogo/arquivo/:id/download', autenticar, verificarAssinatura, async (req, res) => {
   try {
     const doc = await db.collection('arquivos').doc(req.params.id).get();
     if (!doc.exists) return res.status(404).json({ erro: 'Arquivo nao encontrado' });
@@ -929,7 +993,7 @@ app.post('/api/catalogo/arquivo/:id/download', autenticar, async (req, res) => {
 
 // Link temporario para VISUALIZAR o arquivo (imagem ou PDF) sem forcar download
 // e sem contar como download. Usado pelas miniaturas e pelo botao de previa.
-app.get('/api/catalogo/arquivo/:id/preview', autenticar, async (req, res) => {
+app.get('/api/catalogo/arquivo/:id/preview', autenticar, verificarAssinatura, async (req, res) => {
   try {
     const doc = await db.collection('arquivos').doc(req.params.id).get();
     if (!doc.exists) return res.status(404).json({ erro: 'Arquivo nao encontrado' });
@@ -946,11 +1010,35 @@ app.get('/api/catalogo/arquivo/:id/preview', autenticar, async (req, res) => {
 });
 
 // ============ ROTAS PROTEGIDAS ============
-app.get('/api/me', autenticar, (req, res) => {
+app.get('/api/me', autenticar, async (req, res) => {
+  const souAdmin = ehAdminEmail(req.usuario.email);
+  let statusAssinatura = 'pago'; // admins sempre liberados
+
+  if (!souAdmin) {
+    try {
+      const ref = db.collection('usuarios').doc(req.usuario.uid);
+      const doc = await ref.get();
+      if (!doc.exists) {
+        await ref.set({
+          email: req.usuario.email,
+          status: 'pendente',
+          criadoEm: new Date().toISOString(),
+          atualizadoEm: new Date().toISOString(),
+        });
+        statusAssinatura = 'pendente';
+      } else {
+        statusAssinatura = doc.data().status || 'pendente';
+      }
+    } catch (e) {
+      statusAssinatura = 'pendente';
+    }
+  }
+
   res.json({
     ok: true,
     usuario: req.usuario,
-    admin: ADMIN_EMAILS.length === 0 || ADMIN_EMAILS.includes(req.usuario.email),
+    admin: souAdmin,
+    statusAssinatura,
   });
 });
 
