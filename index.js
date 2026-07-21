@@ -730,11 +730,26 @@ app.get('/admin/stats', autenticar, somenteAdmin, async (req, res) => {
       const u = await db.collection('usuarios').count().get();
       totalUsuarios = u.data().count;
     } catch (e) { /* colecao ainda nao existe */ }
+
+    // Espaco usado no R2 = soma do tamanho de todos os arquivos ja importados.
+    // Tenta a agregacao nativa do Firestore (rapida); se nao suportada, soma manualmente.
+    let espacoUsadoBytes = 0;
+    try {
+      const somaSnap = await db.collection('arquivos')
+        .aggregate({ totalBytes: admin.firestore.AggregateField.sum('tamanho') })
+        .get();
+      espacoUsadoBytes = somaSnap.data().totalBytes || 0;
+    } catch (e) {
+      const todosSnap = await db.collection('arquivos').select('tamanho').get();
+      espacoUsadoBytes = todosSnap.docs.reduce((acc, d) => acc + (d.data().tamanho || 0), 0);
+    }
+
     res.json({
       ok: true,
       totalArquivos: agg.data().count,
       totalUsuarios,
       importacaoAtiva: jobAtivo.id,
+      espacoUsadoBytes,
     });
   } catch (e) {
     res.status(500).json({ erro: e.message });
@@ -752,7 +767,22 @@ app.get('/api/catalogo/home', autenticar, async (req, res) => {
       .map((d) => ({ nome: d.data().nome, total: d.data().total || 0 }))
       .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' }));
 
-    res.json({ ok: true, arquivos, categorias });
+    // Estatisticas reais para os cards do topo
+    const seteDiasAtras = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const [totalArquivosSnap, novosSemanaSnap, globalSnap] = await Promise.all([
+      db.collection('arquivos').count().get(),
+      db.collection('arquivos').where('importadoEm', '>=', seteDiasAtras).count().get(),
+      db.collection('stats').doc('global').get(),
+    ]);
+
+    const stats = {
+      totalArquivos: totalArquivosSnap.data().count,
+      totalCategorias: categorias.length,
+      novosSemana: novosSemanaSnap.data().count,
+      totalDownloads: globalSnap.exists ? globalSnap.data().totalDownloads || 0 : 0,
+    };
+
+    res.json({ ok: true, arquivos, categorias, stats });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
@@ -887,6 +917,10 @@ app.post('/api/catalogo/arquivo/:id/download', autenticar, async (req, res) => {
       { expiresIn: 600 }
     );
     doc.ref.set({ downloads: (a.downloads || 0) + 1 }, { merge: true });
+    db.collection('stats').doc('global').set(
+      { totalDownloads: admin.firestore.FieldValue.increment(1) },
+      { merge: true }
+    );
     res.json({ ok: true, url, nome: a.nome });
   } catch (e) {
     res.status(500).json({ erro: e.message });
