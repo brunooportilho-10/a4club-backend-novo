@@ -786,6 +786,105 @@ app.post('/admin/usuarios/:uid/status', autenticar, somenteAdmin, async (req, re
   }
 });
 
+// Exclui UM arquivo especifico (R2 + Firestore) e ajusta a contagem da categoria
+app.post('/admin/arquivo/:id/excluir', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    const doc = await db.collection('arquivos').doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ erro: 'Arquivo nao encontrado' });
+    const a = doc.data();
+
+    if (a.r2Key) {
+      try {
+        await r2.send(new DeleteObjectsCommand({
+          Bucket: R2_BUCKET,
+          Delete: { Objects: [{ Key: a.r2Key }] },
+        }));
+      } catch (e) { /* segue mesmo se o objeto ja nao existir no R2 */ }
+    }
+
+    await doc.ref.delete();
+
+    if (a.categoria) {
+      await db.collection('categorias').doc(a.categoria).set(
+        { total: admin.firestore.FieldValue.increment(-1) },
+        { merge: true }
+      );
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.log('Erro ao excluir arquivo: ' + e.message);
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Exclui uma PASTA inteira (e tudo dentro dela, recursivamente) - ou a categoria toda se caminho for vazio.
+// Remove os arquivos do R2, os docs no Firestore e os nos da arvore de pastas.
+app.post('/admin/pasta/excluir', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    const { categoria, caminho } = req.body;
+    if (!categoria) return res.status(400).json({ erro: 'categoria obrigatoria' });
+    const prefixo = caminho || '';
+
+    const snap = await db.collection('arquivos').where('categoria', '==', categoria).get();
+    const alvos = snap.docs.filter((d) => {
+      if (!prefixo) return true; // excluindo a categoria inteira
+      const pp = d.data().pastaPai || '';
+      return pp === prefixo || pp.startsWith(prefixo + '/');
+    });
+
+    if (alvos.length === 0) {
+      return res.json({ ok: true, apagados: 0, mensagem: 'Nenhum arquivo encontrado nessa pasta.' });
+    }
+
+    // Apaga do R2 em lotes de 1000 (limite da API)
+    const chaves = alvos.map((d) => ({ Key: d.data().r2Key })).filter((o) => o.Key);
+    for (let i = 0; i < chaves.length; i += 1000) {
+      const lote = chaves.slice(i, i + 1000);
+      if (lote.length > 0) {
+        await r2.send(new DeleteObjectsCommand({ Bucket: R2_BUCKET, Delete: { Objects: lote } }));
+      }
+    }
+
+    // Apaga os documentos do Firestore em lotes
+    for (let i = 0; i < alvos.length; i += 400) {
+      const batch = db.batch();
+      alvos.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+
+    // Remove os nos da arvore de pastas dentro do prefixo (ou tudo, se for a categoria inteira)
+    const pastasSnap = await db.collection('pastas').where('categoria', '==', categoria).get();
+    const pastasAlvo = pastasSnap.docs.filter((d) => {
+      if (!prefixo) return true;
+      const c = d.data().caminho;
+      return c === prefixo || c.startsWith(prefixo + '/');
+    });
+    for (let i = 0; i < pastasAlvo.length; i += 400) {
+      const batch = db.batch();
+      pastasAlvo.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+
+    // Recalcula o total da categoria (ou remove se ficou vazia)
+    const restantesSnap = await db.collection('arquivos').where('categoria', '==', categoria).count().get();
+    const restantes = restantesSnap.data().count;
+    if (restantes === 0) {
+      await db.collection('categorias').doc(categoria).delete();
+    } else {
+      await db.collection('categorias').doc(categoria).set(
+        { total: restantes, atualizadoEm: new Date().toISOString() },
+        { merge: true }
+      );
+    }
+
+    res.json({ ok: true, apagados: alvos.length, categoriaRemovida: restantes === 0 });
+  } catch (e) {
+    console.log('Erro ao excluir pasta: ' + e.message);
+    res.status(500).json({ erro: e.message });
+  }
+});
+
 app.get('/admin/stats', autenticar, somenteAdmin, async (req, res) => {
   try {
     const agg = await db.collection('arquivos').count().get();
