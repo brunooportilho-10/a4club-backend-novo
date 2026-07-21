@@ -254,6 +254,23 @@ function nomeCategoria(nomeDrive) {
   return nomeDrive.replace(/^DV\s*-\s*/i, '').trim();
 }
 
+function safeId(str) {
+  return String(str).replace(/[\/\s]+/g, '_').slice(0, 120);
+}
+
+function mapArquivo(doc) {
+  const a = doc.data();
+  return {
+    id: doc.id,
+    nome: a.nome,
+    categoria: a.categoria,
+    colecao: a.colecao || null,
+    extensao: a.extensao,
+    tamanho: a.tamanho,
+    importadoEm: a.importadoEm,
+  };
+}
+
 async function listarRecursivo(drive, pastaId, caminho, lista, nivel) {
   if (nivel > 10) return;
   let pageToken = null;
@@ -350,6 +367,17 @@ async function processarArquivo(drive, arq, categoriaFixa, contadores, errosLog)
       total: admin.firestore.FieldValue.increment(1),
       atualizadoEm: new Date().toISOString(),
     }, { merge: true });
+
+    // Registra o estudio/colecao (subpasta) para navegacao tipo "pasta" no catalogo
+    if (colecao) {
+      const colecaoId = safeId(categoriaFixa) + '__' + safeId(colecao);
+      await db.collection('colecoes').doc(colecaoId).set({
+        categoria: categoriaFixa,
+        colecao,
+        total: admin.firestore.FieldValue.increment(1),
+        atualizadoEm: new Date().toISOString(),
+      }, { merge: true });
+    }
 
     contadores.importados++;
   } catch (e) {
@@ -529,6 +557,14 @@ app.post('/admin/reset', autenticar, somenteAdmin, async (req, res) => {
       await batch.commit();
     }
 
+    // Apaga a colecao "colecoes" (estudios)
+    const colsSnap = await db.collection('colecoes').get();
+    if (!colsSnap.empty) {
+      const batch = db.batch();
+      colsSnap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+
     // Apaga os objetos do R2 (prefixo "arquivos/")
     let apagadosR2 = 0;
     let continuationToken = undefined;
@@ -579,13 +615,7 @@ app.get('/admin/stats', autenticar, somenteAdmin, async (req, res) => {
 app.get('/api/catalogo/home', autenticar, async (req, res) => {
   try {
     const recentes = await db.collection('arquivos').orderBy('importadoEm', 'desc').limit(24).get();
-    const arquivos = recentes.docs.map((d) => {
-      const a = d.data();
-      return {
-        id: d.id, nome: a.nome, categoria: a.categoria, colecao: a.colecao || null,
-        extensao: a.extensao, tamanho: a.tamanho, importadoEm: a.importadoEm,
-      };
-    });
+    const arquivos = recentes.docs.map(mapArquivo);
 
     const catsSnap = await db.collection('categorias').orderBy('nome').get();
     const categorias = catsSnap.docs.map((d) => ({
@@ -599,6 +629,59 @@ app.get('/api/catalogo/home', autenticar, async (req, res) => {
   }
 });
 
+// Lista os "estudios" (subpastas) dentro de uma categoria - como navegar pastas do Drive
+app.get('/api/catalogo/categoria/:nome/colecoes', autenticar, async (req, res) => {
+  try {
+    const snap = await db.collection('colecoes')
+      .where('categoria', '==', req.params.nome)
+      .get();
+    const colecoes = snap.docs
+      .map((d) => ({ nome: d.data().colecao, total: d.data().total || 0 }))
+      .sort((a, b) => a.nome.localeCompare(b.nome));
+
+    const soltosCount = await db.collection('arquivos')
+      .where('categoria', '==', req.params.nome)
+      .where('colecao', '==', null)
+      .count()
+      .get();
+
+    res.json({ ok: true, colecoes, totalSoltos: soltosCount.data().count });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Arquivos de UM estudio especifico dentro da categoria
+app.get('/api/catalogo/categoria/:nome/estudio/:colecao', autenticar, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 200), 300);
+    const snap = await db.collection('arquivos')
+      .where('categoria', '==', req.params.nome)
+      .where('colecao', '==', req.params.colecao)
+      .limit(limit)
+      .get();
+    res.json({ ok: true, arquivos: snap.docs.map(mapArquivo) });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Arquivos soltos direto na categoria (sem subpasta de estudio)
+app.get('/api/catalogo/categoria/:nome/soltos', autenticar, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 200), 300);
+    const snap = await db.collection('arquivos')
+      .where('categoria', '==', req.params.nome)
+      .where('colecao', '==', null)
+      .limit(limit)
+      .get();
+    res.json({ ok: true, arquivos: snap.docs.map(mapArquivo) });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Todos os arquivos de uma categoria, sem separar por estudio (uso geral/compatibilidade)
 app.get('/api/catalogo/categoria/:nome', autenticar, async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 100), 200);
@@ -606,14 +689,7 @@ app.get('/api/catalogo/categoria/:nome', autenticar, async (req, res) => {
       .where('categoria', '==', req.params.nome)
       .limit(limit)
       .get();
-    const arquivos = snap.docs.map((d) => {
-      const a = d.data();
-      return {
-        id: d.id, nome: a.nome, categoria: a.categoria, colecao: a.colecao || null,
-        extensao: a.extensao, tamanho: a.tamanho, importadoEm: a.importadoEm,
-      };
-    });
-    res.json({ ok: true, arquivos });
+    res.json({ ok: true, arquivos: snap.docs.map(mapArquivo) });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
@@ -630,11 +706,7 @@ app.get('/api/catalogo/buscar', autenticar, async (req, res) => {
       .endAt(q + '\uf8ff')
       .limit(limit)
       .get();
-    const arquivos = snap.docs.map((d) => {
-      const a = d.data();
-      return { id: d.id, nome: a.nome, categoria: a.categoria, colecao: a.colecao || null, extensao: a.extensao, tamanho: a.tamanho };
-    });
-    res.json({ ok: true, arquivos });
+    res.json({ ok: true, arquivos: snap.docs.map(mapArquivo) });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
