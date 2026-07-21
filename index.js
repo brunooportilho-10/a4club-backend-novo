@@ -893,6 +893,24 @@ app.post('/api/catalogo/arquivo/:id/download', autenticar, async (req, res) => {
   }
 });
 
+// Link temporario para VISUALIZAR o arquivo (imagem ou PDF) sem forcar download
+// e sem contar como download. Usado pelas miniaturas e pelo botao de previa.
+app.get('/api/catalogo/arquivo/:id/preview', autenticar, async (req, res) => {
+  try {
+    const doc = await db.collection('arquivos').doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ erro: 'Arquivo nao encontrado' });
+    const a = doc.data();
+    const url = await getSignedUrl(
+      r2,
+      new GetObjectCommand({ Bucket: R2_BUCKET, Key: a.r2Key }),
+      { expiresIn: 600 }
+    );
+    res.json({ ok: true, url, mime: a.mime, extensao: a.extensao });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
 // ============ ROTAS PROTEGIDAS ============
 app.get('/api/me', autenticar, (req, res) => {
   res.json({
