@@ -823,7 +823,7 @@ app.get('/admin/stats', autenticar, somenteAdmin, async (req, res) => {
 // ============ CATALOGO ============
 app.get('/api/catalogo/home', autenticar, verificarAssinatura, async (req, res) => {
   try {
-    const recentes = await db.collection('arquivos').orderBy('importadoEm', 'desc').limit(24).get();
+    const recentes = await db.collection('arquivos').orderBy('importadoEm', 'desc').limit(10).get();
     const arquivos = recentes.docs.map(mapArquivo);
 
     const catsSnap = await db.collection('categorias').get();
