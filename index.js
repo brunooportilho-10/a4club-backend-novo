@@ -592,6 +592,64 @@ app.post('/admin/reset', autenticar, somenteAdmin, async (req, res) => {
   }
 });
 
+// Recalcula as colecoes "categorias" e "colecoes" a partir dos arquivos ja
+// existentes no Firestore. Usar quando arquivos foram importados antes de uma
+// correcao de categorizacao - evita ter que reimportar (rebaixar do Drive de novo).
+app.post('/admin/backfill-colecoes', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    const snap = await db.collection('arquivos').select('categoria', 'colecao').get();
+    const contagemCategoria = {};
+    const contagemColecao = {};
+
+    snap.docs.forEach((d) => {
+      const { categoria, colecao } = d.data();
+      if (!categoria) return;
+      contagemCategoria[categoria] = (contagemCategoria[categoria] || 0) + 1;
+      if (colecao) {
+        const key = safeId(categoria) + '__' + safeId(colecao);
+        if (!contagemColecao[key]) contagemColecao[key] = { categoria, colecao, total: 0 };
+        contagemColecao[key].total++;
+      }
+    });
+
+    const catEntradas = Object.entries(contagemCategoria);
+    for (let i = 0; i < catEntradas.length; i += 400) {
+      const batch = db.batch();
+      catEntradas.slice(i, i + 400).forEach(([nome, total]) => {
+        batch.set(
+          db.collection('categorias').doc(nome),
+          { nome, total, atualizadoEm: new Date().toISOString() },
+          { merge: true }
+        );
+      });
+      await batch.commit();
+    }
+
+    const colEntradas = Object.entries(contagemColecao);
+    for (let i = 0; i < colEntradas.length; i += 400) {
+      const batch = db.batch();
+      colEntradas.slice(i, i + 400).forEach(([id, dados]) => {
+        batch.set(
+          db.collection('colecoes').doc(id),
+          { ...dados, atualizadoEm: new Date().toISOString() },
+          { merge: true }
+        );
+      });
+      await batch.commit();
+    }
+
+    res.json({
+      ok: true,
+      totalArquivos: snap.size,
+      categorias: catEntradas.length,
+      colecoes: colEntradas.length,
+    });
+  } catch (e) {
+    console.log('Erro no backfill: ' + e.message);
+    res.status(500).json({ erro: e.message });
+  }
+});
+
 app.get('/admin/stats', autenticar, somenteAdmin, async (req, res) => {
   try {
     const agg = await db.collection('arquivos').count().get();
