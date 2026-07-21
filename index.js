@@ -139,10 +139,24 @@ async function verificarAssinatura(req, res, next) {
         status: 'pendente',
       });
     }
-    const status = doc.data().status || 'pendente';
+    const dados = doc.data();
+    let status = dados.status || 'pendente';
+
+    // Vencimento automatico: se o plano pago passou da data, bloqueia sozinho
+    if (status === 'pago' && dados.validoAte && new Date(dados.validoAte) < new Date()) {
+      status = 'vencido';
+      await ref.set({ status: 'vencido', atualizadoEm: new Date().toISOString() }, { merge: true });
+    }
+
     if (status !== 'pago') {
+      const msgs = {
+        pendente: 'Seu acesso ainda nao foi liberado. Entre em contato com o administrador do A4 CLUB.',
+        suspenso: 'Seu acesso esta suspenso. Entre em contato com o administrador do A4 CLUB.',
+        bloqueado: 'Seu acesso esta bloqueado. Entre em contato com o administrador do A4 CLUB.',
+        vencido: 'Seu plano venceu. Entre em contato com o administrador do A4 CLUB para renovar.',
+      };
       return res.status(403).json({
-        erro: 'Seu acesso esta bloqueado. Entre em contato com o administrador do A4 CLUB.',
+        erro: msgs[status] || msgs.bloqueado,
         status,
       });
     }
@@ -769,17 +783,37 @@ app.get('/admin/usuarios', autenticar, somenteAdmin, async (req, res) => {
   }
 });
 
-// Marca um assinante como pago / pendente / bloqueado
+// Marca um assinante como pago (com prazo em meses) / pendente / suspenso / bloqueado
 app.post('/admin/usuarios/:uid/status', autenticar, somenteAdmin, async (req, res) => {
   try {
-    const { status } = req.body;
-    if (!['pago', 'pendente', 'bloqueado'].includes(status)) {
+    const { status, meses } = req.body;
+    if (!['pago', 'pendente', 'suspenso', 'bloqueado'].includes(status)) {
       return res.status(400).json({ erro: 'Status invalido' });
     }
-    await db.collection('usuarios').doc(req.params.uid).set(
-      { status, atualizadoEm: new Date().toISOString() },
-      { merge: true }
-    );
+    const dados = { status, atualizadoEm: new Date().toISOString() };
+
+    if (status === 'pago') {
+      const m = [1, 3, 6, 12].includes(Number(meses)) ? Number(meses) : 1;
+      const validoAte = new Date();
+      validoAte.setMonth(validoAte.getMonth() + m);
+      dados.validoAte = validoAte.toISOString();
+      dados.plano = m + '_meses';
+    }
+
+    await db.collection('usuarios').doc(req.params.uid).set(dados, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Exclui a conta do assinante de vez (Firestore + Firebase Auth) - ele precisaria se cadastrar de novo
+app.post('/admin/usuarios/:uid/excluir', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    await db.collection('usuarios').doc(req.params.uid).delete();
+    try {
+      await admin.auth().deleteUser(req.params.uid);
+    } catch (e) { /* conta pode ja nao existir no Auth */ }
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ erro: e.message });
@@ -1126,7 +1160,12 @@ app.get('/api/me', autenticar, async (req, res) => {
         });
         statusAssinatura = 'pendente';
       } else {
-        statusAssinatura = doc.data().status || 'pendente';
+        const dados = doc.data();
+        statusAssinatura = dados.status || 'pendente';
+        if (statusAssinatura === 'pago' && dados.validoAte && new Date(dados.validoAte) < new Date()) {
+          statusAssinatura = 'vencido';
+          await ref.set({ status: 'vencido', atualizadoEm: new Date().toISOString() }, { merge: true });
+        }
       }
     } catch (e) {
       statusAssinatura = 'pendente';
