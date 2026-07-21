@@ -675,11 +675,10 @@ app.get('/api/catalogo/home', autenticar, async (req, res) => {
     const recentes = await db.collection('arquivos').orderBy('importadoEm', 'desc').limit(24).get();
     const arquivos = recentes.docs.map(mapArquivo);
 
-    const catsSnap = await db.collection('categorias').orderBy('nome').get();
-    const categorias = catsSnap.docs.map((d) => ({
-      nome: d.data().nome,
-      total: d.data().total || 0,
-    }));
+    const catsSnap = await db.collection('categorias').get();
+    const categorias = catsSnap.docs
+      .map((d) => ({ nome: d.data().nome, total: d.data().total || 0 }))
+      .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' }));
 
     res.json({ ok: true, arquivos, categorias });
   } catch (e) {
@@ -695,7 +694,7 @@ app.get('/api/catalogo/categoria/:nome/colecoes', autenticar, async (req, res) =
       .get();
     const colecoes = snap.docs
       .map((d) => ({ nome: d.data().colecao, total: d.data().total || 0 }))
-      .sort((a, b) => a.nome.localeCompare(b.nome));
+      .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' }));
 
     const soltosCount = await db.collection('arquivos')
       .where('categoria', '==', req.params.nome)
@@ -712,13 +711,14 @@ app.get('/api/catalogo/categoria/:nome/colecoes', autenticar, async (req, res) =
 // Arquivos de UM estudio especifico dentro da categoria
 app.get('/api/catalogo/categoria/:nome/estudio/:colecao', autenticar, async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 200), 300);
+    const limit = Math.min(Number(req.query.limit || 300), 500);
     const snap = await db.collection('arquivos')
       .where('categoria', '==', req.params.nome)
       .where('colecao', '==', req.params.colecao)
       .limit(limit)
       .get();
-    res.json({ ok: true, arquivos: snap.docs.map(mapArquivo) });
+    const arquivos = snap.docs.map(mapArquivo).sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' }));
+    res.json({ ok: true, arquivos });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
@@ -727,13 +727,14 @@ app.get('/api/catalogo/categoria/:nome/estudio/:colecao', autenticar, async (req
 // Arquivos soltos direto na categoria (sem subpasta de estudio)
 app.get('/api/catalogo/categoria/:nome/soltos', autenticar, async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 200), 300);
+    const limit = Math.min(Number(req.query.limit || 300), 500);
     const snap = await db.collection('arquivos')
       .where('categoria', '==', req.params.nome)
       .where('colecao', '==', null)
       .limit(limit)
       .get();
-    res.json({ ok: true, arquivos: snap.docs.map(mapArquivo) });
+    const arquivos = snap.docs.map(mapArquivo).sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' }));
+    res.json({ ok: true, arquivos });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
@@ -742,12 +743,13 @@ app.get('/api/catalogo/categoria/:nome/soltos', autenticar, async (req, res) => 
 // Todos os arquivos de uma categoria, sem separar por estudio (uso geral/compatibilidade)
 app.get('/api/catalogo/categoria/:nome', autenticar, async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 100), 200);
+    const limit = Math.min(Number(req.query.limit || 100), 300);
     const snap = await db.collection('arquivos')
       .where('categoria', '==', req.params.nome)
       .limit(limit)
       .get();
-    res.json({ ok: true, arquivos: snap.docs.map(mapArquivo) });
+    const arquivos = snap.docs.map(mapArquivo).sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' }));
+    res.json({ ok: true, arquivos });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
