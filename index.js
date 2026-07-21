@@ -95,7 +95,7 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 async function autenticar(req, res, next) {
   try {
@@ -1153,17 +1153,24 @@ app.get('/api/catalogo/arquivo/:id/preview', autenticar, verificarAssinatura, as
 app.get('/api/me', autenticar, async (req, res) => {
   const souAdmin = ehAdminEmail(req.usuario.email);
   let statusAssinatura = 'pago'; // admins sempre liberados
+  let plano = null;
+  let validoAte = null;
 
   if (!souAdmin) {
     try {
       const ref = db.collection('usuarios').doc(req.usuario.uid);
       const doc = await ref.get();
       if (!doc.exists) {
-        await ref.set(dadosTrialNovo(req.usuario.email));
+        const novo = dadosTrialNovo(req.usuario.email);
+        await ref.set(novo);
         statusAssinatura = 'pago';
+        plano = novo.plano;
+        validoAte = novo.validoAte;
       } else {
         const dados = doc.data();
         statusAssinatura = dados.status || 'pendente';
+        plano = dados.plano || null;
+        validoAte = dados.validoAte || null;
         if (statusAssinatura === 'pago' && dados.validoAte && new Date(dados.validoAte) < new Date()) {
           statusAssinatura = 'vencido';
           await ref.set({ status: 'vencido', atualizadoEm: new Date().toISOString() }, { merge: true });
@@ -1179,7 +1186,102 @@ app.get('/api/me', autenticar, async (req, res) => {
     usuario: req.usuario,
     admin: souAdmin,
     statusAssinatura,
+    plano,
+    validoAte,
   });
+});
+
+// ============ COMPROVANTES DE PAGAMENTO ============
+const DIAS_GUARDAR_COMPROVANTE = 60;
+
+// Cliente envia um comprovante (imagem ou PDF em base64)
+app.post('/api/comprovante', autenticar, async (req, res) => {
+  try {
+    const { nomeArquivo, mime, conteudoBase64 } = req.body;
+    if (!nomeArquivo || !mime || !conteudoBase64) {
+      return res.status(400).json({ erro: 'Dados incompletos' });
+    }
+    const buffer = Buffer.from(conteudoBase64, 'base64');
+    if (buffer.length > 8 * 1024 * 1024) {
+      return res.status(400).json({ erro: 'Arquivo muito grande (máximo 8 MB)' });
+    }
+
+    const uid = req.usuario.uid;
+    const nomeSeguro = nomeArquivo.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const r2Key = `comprovantes/${uid}/${Date.now()}-${nomeSeguro}`;
+
+    const upload = new Upload({
+      client: r2,
+      params: { Bucket: R2_BUCKET, Key: r2Key, Body: buffer, ContentType: mime },
+    });
+    await upload.done();
+
+    const colecao = db.collection('usuarios').doc(uid).collection('comprovantes');
+    const docRef = colecao.doc();
+    await docRef.set({
+      nome: nomeArquivo,
+      r2Key,
+      mime,
+      tamanho: buffer.length,
+      enviadoEm: new Date().toISOString(),
+    });
+
+    // Limpa comprovantes com mais de 60 dias deste mesmo usuario
+    const limite = new Date();
+    limite.setDate(limite.getDate() - DIAS_GUARDAR_COMPROVANTE);
+    const antigosSnap = await colecao.where('enviadoEm', '<', limite.toISOString()).get();
+    for (const d of antigosSnap.docs) {
+      try {
+        await r2.send(new DeleteObjectsCommand({ Bucket: R2_BUCKET, Delete: { Objects: [{ Key: d.data().r2Key }] } }));
+      } catch (e) { /* objeto pode ja nao existir */ }
+      await d.ref.delete();
+    }
+
+    res.json({ ok: true, id: docRef.id });
+  } catch (e) {
+    console.log('Erro ao enviar comprovante: ' + e.message);
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Cliente lista os proprios comprovantes (ultimos 60 dias, o resto ja foi limpo)
+app.get('/api/comprovante', autenticar, async (req, res) => {
+  try {
+    const snap = await db.collection('usuarios').doc(req.usuario.uid).collection('comprovantes')
+      .orderBy('enviadoEm', 'desc').get();
+    const comprovantes = snap.docs.map((d) => ({ id: d.id, nome: d.data().nome, mime: d.data().mime, tamanho: d.data().tamanho, enviadoEm: d.data().enviadoEm }));
+    res.json({ ok: true, comprovantes });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Admin ve os comprovantes de um assinante especifico (para revisar antes de aprovar)
+app.get('/admin/usuarios/:uid/comprovantes', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    const snap = await db.collection('usuarios').doc(req.params.uid).collection('comprovantes')
+      .orderBy('enviadoEm', 'desc').get();
+    const comprovantes = snap.docs.map((d) => ({ id: d.id, nome: d.data().nome, mime: d.data().mime, tamanho: d.data().tamanho, enviadoEm: d.data().enviadoEm }));
+    res.json({ ok: true, comprovantes });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// Admin gera um link temporario para abrir/baixar um comprovante especifico
+app.get('/admin/usuarios/:uid/comprovantes/:id/url', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    const doc = await db.collection('usuarios').doc(req.params.uid).collection('comprovantes').doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ erro: 'Comprovante nao encontrado' });
+    const url = await getSignedUrl(
+      r2,
+      new GetObjectCommand({ Bucket: R2_BUCKET, Key: doc.data().r2Key }),
+      { expiresIn: 600 }
+    );
+    res.json({ ok: true, url });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
 });
 
 // ============ START ============
