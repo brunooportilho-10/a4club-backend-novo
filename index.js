@@ -66,8 +66,7 @@ function novoOAuthClient() {
     REDIRECT_URI
   );
 }
-
-const SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
+const SCOPES = ['https://www.googleapis.com/auth/drive.readonly', 'https://www.googleapis.com/auth/drive.file'];
 
 async function clientComTokens() {
   if (!db) return null;
@@ -915,6 +914,197 @@ app.post('/admin/pasta/excluir', autenticar, somenteAdmin, async (req, res) => {
     res.json({ ok: true, apagados: alvos.length, categoriaRemovida: restantes === 0 });
   } catch (e) {
     console.log('Erro ao excluir pasta: ' + e.message);
+    res.status(500).json({ erro: e.message });
+  }
+});
+javascript
+// ============ BACKUP (R2 -> Google Drive) ============
+
+async function garantirPastaRaizBackup(drive) {
+  const configRef = db.collection('config').doc('backup_drive');
+  const configDoc = await configRef.get();
+
+  if (configDoc.exists && configDoc.data().folderId) {
+    try {
+      await drive.files.get({ fileId: configDoc.data().folderId, fields: 'id', supportsAllDrives: true });
+      return configDoc.data().folderId;
+    } catch (e) {
+      // pasta pode ter sido apagada manualmente - cria de novo abaixo
+    }
+  }
+
+  const criada = await drive.files.create({
+    requestBody: {
+      name: 'A4CLUB - Backup',
+      mimeType: 'application/vnd.google-apps.folder',
+    },
+    fields: 'id',
+  });
+  const folderId = criada.data.id;
+  await configRef.set({ folderId, criadoEm: new Date().toISOString() });
+  return folderId;
+}
+
+async function garantirSubpasta(drive, nome, paiId, cache) {
+  const chave = paiId + '__' + nome;
+  if (cache.has(chave)) return cache.get(chave);
+
+  const busca = await drive.files.list({
+    q: `'${paiId}' in parents and name = '${nome.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+    fields: 'files(id)',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+  });
+
+  let id;
+  if (busca.data.files && busca.data.files.length > 0) {
+    id = busca.data.files[0].id;
+  } else {
+    const criada = await drive.files.create({
+      requestBody: {
+        name: nome,
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: [paiId],
+      },
+      fields: 'id',
+    });
+    id = criada.data.id;
+  }
+  cache.set(chave, id);
+  return id;
+}
+
+async function resolverPastaDestino(drive, raizId, categoria, pastaPai, cache) {
+  let atual = await garantirSubpasta(drive, categoria, raizId, cache);
+  if (pastaPai) {
+    const segmentos = pastaPai.split('/').filter(Boolean);
+    for (const seg of segmentos) {
+      atual = await garantirSubpasta(drive, seg, atual, cache);
+    }
+  }
+  return atual;
+}
+
+async function executarBackup(jobId) {
+  const contadores = { importados: 0, pulados: 0, erros: 0, processados: 0 };
+  const errosLog = [];
+  const cachePastas = new Map();
+
+  try {
+    const oauth = await clientComTokens();
+    if (!oauth) throw new Error('Google Drive nao conectado');
+    const drive = google.drive({ version: 'v3', auth: oauth });
+
+    await atualizarJob(jobId, { status: 'listando', mensagem: 'Verificando pasta de backup no Drive...' });
+    const raizId = await garantirPastaRaizBackup(drive);
+
+    await atualizarJob(jobId, { status: 'listando', mensagem: 'Selecionando arquivos pendentes de backup...' });
+    const todosSnap = await db.collection('arquivos').get();
+    const pendentes = todosSnap.docs.filter((d) => !d.data().backupDriveId);
+
+    await atualizarJob(jobId, {
+      status: 'executando',
+      total: pendentes.length,
+      mensagem: 'Enviando arquivos para o Drive...',
+    });
+
+    let indice = 0;
+    async function trabalhador() {
+      while (indice < pendentes.length) {
+        if (jobAtivo.cancelado) return;
+        while (jobAtivo.pausado) {
+          await new Promise((r) => setTimeout(r, 2000));
+          if (jobAtivo.cancelado) return;
+        }
+        const meuIndice = indice++;
+        if (meuIndice >= pendentes.length) return;
+        const doc = pendentes[meuIndice];
+        const a = doc.data();
+        try {
+          const pastaId = await resolverPastaDestino(drive, raizId, a.categoria, a.pastaPai || '', cachePastas);
+          const objeto = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: a.r2Key }));
+
+          const upload = await drive.files.create({
+            requestBody: { name: a.nome, parents: [pastaId] },
+            media: { mimeType: a.mime || 'application/octet-stream', body: objeto.Body },
+            fields: 'id',
+          });
+
+          await doc.ref.set(
+            { backupDriveId: upload.data.id, backupEm: new Date().toISOString() },
+            { merge: true }
+          );
+          contadores.importados++;
+        } catch (e) {
+          contadores.erros++;
+          if (errosLog.length < 20) errosLog.push(a.nome + ': ' + e.message);
+          console.log('Erro no backup de ' + a.nome + ': ' + e.message);
+        }
+        contadores.processados++;
+        if (contadores.processados % 5 === 0 || contadores.processados === pendentes.length) {
+          await atualizarJob(jobId, { ...contadores, errosLog });
+        }
+      }
+    }
+
+    const trabalhadores = [];
+    for (let i = 0; i < 2; i++) trabalhadores.push(trabalhador());
+    await Promise.all(trabalhadores);
+
+    const statusFinal = jobAtivo.cancelado ? 'cancelado' : 'concluido';
+    await atualizarJob(jobId, {
+      ...contadores,
+      errosLog,
+      status: statusFinal,
+      mensagem: statusFinal === 'concluido'
+        ? `Backup concluido: ${contadores.importados} enviados, ${contadores.pulados} pulados, ${contadores.erros} erros`
+        : 'Backup cancelado',
+      finalizadoEm: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.log('Erro no backup ' + jobId + ': ' + e.message);
+    await atualizarJob(jobId, {
+      ...contadores,
+      status: 'erro',
+      mensagem: e.message,
+      finalizadoEm: new Date().toISOString(),
+    });
+  } finally {
+    jobAtivo.id = null;
+    jobAtivo.pausado = false;
+    jobAtivo.cancelado = false;
+  }
+}
+
+app.post('/admin/backup/iniciar', autenticar, somenteAdmin, async (req, res) => {
+  try {
+    if (jobAtivo.id) {
+      return res.status(409).json({ erro: 'Ja existe uma operacao em andamento (importacao ou backup). Aguarde terminar.', jobId: jobAtivo.id });
+    }
+
+    const jobRef = db.collection('jobs').doc();
+    const jobId = jobRef.id;
+    await jobRef.set({
+      tipo: 'backup',
+      pastaNome: 'Backup para o Google Drive',
+      status: 'iniciando',
+      total: 0,
+      processados: 0,
+      importados: 0,
+      pulados: 0,
+      erros: 0,
+      iniciadoEm: new Date().toISOString(),
+      atualizadoEm: new Date().toISOString(),
+    });
+
+    jobAtivo.id = jobId;
+    jobAtivo.pausado = false;
+    jobAtivo.cancelado = false;
+
+    executarBackup(jobId);
+
+    res.json({ ok: true, jobId });
+  } catch (e) {
     res.status(500).json({ erro: e.message });
   }
 });
