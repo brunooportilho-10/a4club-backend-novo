@@ -265,6 +265,7 @@ function mapArquivo(doc) {
     nome: a.nome,
     categoria: a.categoria,
     colecao: a.colecao || null,
+    pastaPai: a.pastaPai || '',
     extensao: a.extensao,
     tamanho: a.tamanho,
     importadoEm: a.importadoEm,
@@ -308,7 +309,29 @@ async function atualizarJob(jobId, dados) {
   );
 }
 
-async function processarArquivo(drive, arq, categoriaFixa, contadores, errosLog) {
+// Registra cada nivel da cadeia de pastas (ex: "Lina Criativa/Cartao Sus 1/- Porta Chaveirinho")
+// como um no navegavel na colecao 'pastas', igual a estrutura real do Drive.
+// pastasRegistradas eh um Set compartilhado no job inteiro, para nao escrever o mesmo no varias vezes.
+async function registrarCadeiaPastas(categoria, pastaRelativa, pastasRegistradas) {
+  if (!pastaRelativa) return;
+  const segmentos = pastaRelativa.split('/').filter(Boolean);
+  let acumulado = '';
+  for (const seg of segmentos) {
+    const pai = acumulado;
+    acumulado = acumulado ? acumulado + '/' + seg : seg;
+    const pastaId = safeId(categoria) + '__' + safeId(acumulado);
+    if (pastasRegistradas.has(pastaId)) continue;
+    pastasRegistradas.add(pastaId);
+    await db.collection('pastas').doc(pastaId).set({
+      categoria,
+      caminho: acumulado,
+      nome: seg,
+      pai,
+    }, { merge: true });
+  }
+}
+
+async function processarArquivo(drive, arq, categoriaFixa, contadores, errosLog, pastasRegistradas) {
   try {
     if (!arq.md5) {
       contadores.pulados++;
@@ -340,9 +363,11 @@ async function processarArquivo(drive, arq, categoriaFixa, contadores, errosLog)
     await upload.done();
 
     // categoria = o Drive/pasta que foi sincronizada (fixa para o job inteiro)
-    // colecao = a subpasta logo abaixo dela (normalmente o nome do estudio/artista)
+    // pastaPai = TODO o caminho de subpastas ate o arquivo, igual a estrutura do Drive
+    // (ex: "Lina Criativa/Cartao Sus 1/- Porta Chaveirinho")
     const partes = arq.caminho.split('/').filter(Boolean);
-    const colecao = partes.length > 1 ? partes[1] : null;
+    const pastaPai = partes.slice(1).join('/'); // remove o 1o segmento (nome cru da pasta raiz)
+    const colecao = partes.length > 1 ? partes[1] : null; // mantido para compatibilidade
 
     await docRef.set({
       nome: arq.nome,
@@ -352,6 +377,7 @@ async function processarArquivo(drive, arq, categoriaFixa, contadores, errosLog)
       mime: arq.mime,
       extensao: extensao(arq.nome),
       categoria: categoriaFixa,
+      pastaPai,
       colecao,
       caminho: arq.caminho,
       r2Key,
@@ -368,16 +394,8 @@ async function processarArquivo(drive, arq, categoriaFixa, contadores, errosLog)
       atualizadoEm: new Date().toISOString(),
     }, { merge: true });
 
-    // Registra o estudio/colecao (subpasta) para navegacao tipo "pasta" no catalogo
-    if (colecao) {
-      const colecaoId = safeId(categoriaFixa) + '__' + safeId(colecao);
-      await db.collection('colecoes').doc(colecaoId).set({
-        categoria: categoriaFixa,
-        colecao,
-        total: admin.firestore.FieldValue.increment(1),
-        atualizadoEm: new Date().toISOString(),
-      }, { merge: true });
-    }
+    // Registra TODOS os niveis da arvore de pastas, igual ao Drive
+    await registrarCadeiaPastas(categoriaFixa, pastaPai, pastasRegistradas);
 
     contadores.importados++;
   } catch (e) {
@@ -391,6 +409,7 @@ async function executarJob(jobId, pastaId, pastaNome) {
   const contadores = { importados: 0, pulados: 0, erros: 0, processados: 0 };
   const errosLog = [];
   const categoriaFixa = nomeCategoria(pastaNome);
+  const pastasRegistradas = new Set(); // evita reescrever a mesma pasta varias vezes no job
   try {
     const oauth = await clientComTokens();
     if (!oauth) throw new Error('Google Drive nao conectado');
@@ -418,7 +437,7 @@ async function executarJob(jobId, pastaId, pastaNome) {
         const meuIndice = indice++;
         if (meuIndice >= lista.length) return;
         const arq = lista[meuIndice];
-        await processarArquivo(drive, arq, categoriaFixa, contadores, errosLog);
+        await processarArquivo(drive, arq, categoriaFixa, contadores, errosLog, pastasRegistradas);
         contadores.processados++;
         if (contadores.processados % 10 === 0 || contadores.processados === lista.length) {
           await atualizarJob(jobId, { ...contadores, errosLog });
@@ -565,6 +584,14 @@ app.post('/admin/reset', autenticar, somenteAdmin, async (req, res) => {
       await batch.commit();
     }
 
+    // Apaga a colecao "pastas" (arvore de navegacao)
+    const pastasSnapReset = await db.collection('pastas').get();
+    if (!pastasSnapReset.empty) {
+      const batch = db.batch();
+      pastasSnapReset.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+
     // Apaga os objetos do R2 (prefixo "arquivos/")
     let apagadosR2 = 0;
     let continuationToken = undefined;
@@ -592,25 +619,69 @@ app.post('/admin/reset', autenticar, somenteAdmin, async (req, res) => {
   }
 });
 
-// Recalcula as colecoes "categorias" e "colecoes" a partir dos arquivos ja
-// existentes no Firestore. Usar quando arquivos foram importados antes de uma
-// correcao de categorizacao - evita ter que reimportar (rebaixar do Drive de novo).
+// Recalcula categorias, colecoes E a arvore completa de pastas (pastaPai em cada
+// arquivo + colecao 'pastas') a partir do campo 'caminho' ja salvo nos arquivos.
+// Nao baixa nada do Drive de novo - so reorganiza o que ja esta no Firestore.
 app.post('/admin/backfill-colecoes', autenticar, somenteAdmin, async (req, res) => {
   try {
-    const snap = await db.collection('arquivos').select('categoria', 'colecao').get();
     const contagemCategoria = {};
     const contagemColecao = {};
+    const pastasRegistradas = new Set();
+    let totalProcessados = 0;
+    let ultimoDoc = null;
 
-    snap.docs.forEach((d) => {
-      const { categoria, colecao } = d.data();
-      if (!categoria) return;
-      contagemCategoria[categoria] = (contagemCategoria[categoria] || 0) + 1;
-      if (colecao) {
-        const key = safeId(categoria) + '__' + safeId(colecao);
-        if (!contagemColecao[key]) contagemColecao[key] = { categoria, colecao, total: 0 };
-        contagemColecao[key].total++;
+    while (true) {
+      let query = db.collection('arquivos').orderBy(admin.firestore.FieldPath.documentId()).limit(300);
+      if (ultimoDoc) query = query.startAfter(ultimoDoc);
+      const pagina = await query.get();
+      if (pagina.empty) break;
+
+      const batch = db.batch();
+      for (const doc of pagina.docs) {
+        const a = doc.data();
+        if (!a.categoria || !a.caminho) continue;
+
+        const partes = String(a.caminho).split('/').filter(Boolean);
+        const pastaPai = partes.slice(1).join('/');
+        const colecao = partes.length > 1 ? partes[1] : null;
+
+        // Atualiza o arquivo com pastaPai, se ainda nao tiver
+        if (a.pastaPai === undefined || a.pastaPai !== pastaPai) {
+          batch.set(doc.ref, { pastaPai, colecao }, { merge: true });
+        }
+
+        contagemCategoria[a.categoria] = (contagemCategoria[a.categoria] || 0) + 1;
+        if (colecao) {
+          const key = safeId(a.categoria) + '__' + safeId(colecao);
+          if (!contagemColecao[key]) contagemColecao[key] = { categoria: a.categoria, colecao, total: 0 };
+          contagemColecao[key].total++;
+        }
+
+        // Registra a arvore inteira de pastas (todos os niveis)
+        if (pastaPai) {
+          const segmentos = pastaPai.split('/').filter(Boolean);
+          let acumulado = '';
+          for (const seg of segmentos) {
+            const pai = acumulado;
+            acumulado = acumulado ? acumulado + '/' + seg : seg;
+            const pastaId = safeId(a.categoria) + '__' + safeId(acumulado);
+            if (pastasRegistradas.has(pastaId)) continue;
+            pastasRegistradas.add(pastaId);
+            batch.set(
+              db.collection('pastas').doc(pastaId),
+              { categoria: a.categoria, caminho: acumulado, nome: seg, pai },
+              { merge: true }
+            );
+          }
+        }
+
+        totalProcessados++;
       }
-    });
+      await batch.commit();
+
+      ultimoDoc = pagina.docs[pagina.docs.length - 1];
+      if (pagina.size < 300) break;
+    }
 
     const catEntradas = Object.entries(contagemCategoria);
     for (let i = 0; i < catEntradas.length; i += 400) {
@@ -640,9 +711,10 @@ app.post('/admin/backfill-colecoes', autenticar, somenteAdmin, async (req, res) 
 
     res.json({
       ok: true,
-      totalArquivos: snap.size,
+      totalArquivos: totalProcessados,
       categorias: catEntradas.length,
       colecoes: colEntradas.length,
+      pastas: pastasRegistradas.size,
     });
   } catch (e) {
     console.log('Erro no backfill: ' + e.message);
@@ -687,6 +759,34 @@ app.get('/api/catalogo/home', autenticar, async (req, res) => {
 });
 
 // Lista os "estudios" (subpastas) dentro de uma categoria - como navegar pastas do Drive
+// Navegacao genérica por pastas, em qualquer profundidade - igual ao Drive.
+// caminho='' = raiz da categoria. caminho='Lina Criativa/Cartao Sus 1' = dentro dessa subpasta.
+app.get('/api/catalogo/navegar', autenticar, async (req, res) => {
+  try {
+    const categoria = String(req.query.categoria || '');
+    const caminho = String(req.query.caminho || '');
+    if (!categoria) return res.status(400).json({ erro: 'categoria obrigatoria' });
+
+    const [pastasSnap, arquivosSnap] = await Promise.all([
+      db.collection('pastas').where('categoria', '==', categoria).where('pai', '==', caminho).get(),
+      db.collection('arquivos').where('categoria', '==', categoria).where('pastaPai', '==', caminho).limit(300).get(),
+    ]);
+
+    const subpastas = pastasSnap.docs
+      .map((d) => ({ nome: d.data().nome, caminho: d.data().caminho }))
+      .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' }));
+
+    const arquivos = arquivosSnap.docs
+      .map(mapArquivo)
+      .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR', { sensitivity: 'base' }));
+
+    res.json({ ok: true, subpastas, arquivos });
+  } catch (e) {
+    console.log('Erro ao navegar: ' + e.message);
+    res.status(500).json({ erro: e.message });
+  }
+});
+
 app.get('/api/catalogo/categoria/:nome/colecoes', autenticar, async (req, res) => {
   try {
     const snap = await db.collection('colecoes')
